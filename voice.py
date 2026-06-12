@@ -4,6 +4,9 @@ import queue
 import re
 import os
 import tempfile
+import logging
+import secrets
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -25,12 +28,24 @@ try:
 except ImportError:
     HAS_PYGAME = False
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('friday_voice.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # -------------------------------------------------------------------
 # TTS – edge-tts (neural) with pyttsx3 fallback
 # -------------------------------------------------------------------
-NEURAL_VOICE   = "en-US-AriaNeural"
+NEURAL_VOICE = "en-US-AriaNeural"
 TEMP_AUDIO_DIR = tempfile.gettempdir()
 _pygame_initialized = False
+_pygame_lock = threading.Lock()
 
 
 async def _speak_neural(text: str) -> bool:
@@ -40,28 +55,31 @@ async def _speak_neural(text: str) -> bool:
         return False
     try:
         communicate = edge_tts.Communicate(text, voice=NEURAL_VOICE, rate="+10%")
+        # Use secrets.token_hex for collision-resistant naming
         audio_file = os.path.join(
             TEMP_AUDIO_DIR,
-            f"friday_tts_{id(asyncio.current_task())}.mp3",
+            f"friday_tts_{secrets.token_hex(8)}.mp3",
         )
         await communicate.save(audio_file)
 
-        if not _pygame_initialized:
-            pygame.mixer.init()
-            _pygame_initialized = True
+        with _pygame_lock:
+            if not _pygame_initialized:
+                pygame.mixer.init()
+                _pygame_initialized = True
 
-        pygame.mixer.music.load(audio_file)
-        pygame.mixer.music.play()
+            pygame.mixer.music.load(audio_file)
+            pygame.mixer.music.play()
+
         while pygame.mixer.music.get_busy():
             await asyncio.sleep(0.05)
 
         try:
             os.remove(audio_file)
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning(f"Failed to delete {audio_file}: {e}")
         return True
     except Exception as e:
-        print(f"⚠️ Neural TTS failed: {e}")
+        logger.error(f"⚠️ Neural TTS failed: {e}")
         return False
 
 
@@ -87,7 +105,7 @@ def _speak_fallback(text: str) -> None:
         finally:
             engine.stop()
     except Exception as e:
-        print(f"⚠️ Fallback TTS error: {e}")
+        logger.error(f"⚠️ Fallback TTS error: {e}")
 
 
 async def text_to_speech(text: str) -> None:
@@ -100,25 +118,33 @@ async def text_to_speech(text: str) -> None:
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"⚠️ Text-to-speech failed: {e}")
+        logger.error(f"⚠️ Text-to-speech failed: {e}")
 
 
 # -------------------------------------------------------------------
 # Audio – Push-to-Talk
 # -------------------------------------------------------------------
 SAMPLE_RATE = 16_000
-BLOCKSIZE   = 1_000
+BLOCKSIZE = 1_000
 _audio_q: queue.Queue = queue.Queue()
+_audio_lock = threading.Lock()
 
 
 def _audio_callback(indata, frames, time, status):
-    _audio_q.put(indata.copy())
+    """Callback for audio stream."""
+    if status:
+        logger.warning(f"Audio callback status: {status}")
+    try:
+        _audio_q.put(indata.copy())
+    except Exception as e:
+        logger.error(f"Error in audio callback: {e}")
 
 
 def _record_sync(key: str = "F2") -> np.ndarray:
     """Blocking: record audio while key is held. Runs in a thread."""
     global _audio_q
-    _audio_q = queue.Queue()        # reset stale audio between recordings
+    with _audio_lock:
+        _audio_q = queue.Queue()  # reset stale audio between recordings
     print(f"🎤 Hold [{key}] to speak. Release to stop.")
     keyboard.wait(key, suppress=True)
     print("🔴 RECORDING… (release key when done)")
@@ -134,7 +160,7 @@ def _record_sync(key: str = "F2") -> np.ndarray:
                 except queue.Empty:
                     pass
     except Exception as e:
-        print(f"⚠️ Recording error: {e}")
+        logger.error(f"⚠️ Recording error: {e}")
     print("⏹️ Recording stopped.")
     if not chunks:
         return np.array([], dtype=np.float32)
@@ -150,36 +176,39 @@ async def record_while_key_held(key: str = "F2") -> np.ndarray:
 # STT – Whisper
 # -------------------------------------------------------------------
 _stt_model = None
+_stt_lock = threading.Lock()
 
 
 def _load_stt_model() -> bool:
     """Lazy-load Whisper on first use to avoid blocking startup."""
     global _stt_model
-    if _stt_model is not None:
-        return True
-    try:
-        print("Loading Whisper model…")
-        _stt_model = whisper.load_model("base")
-        print("✓ Whisper model loaded.")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to load Whisper model: {e}")
-        return False
+    with _stt_lock:
+        if _stt_model is not None:
+            return True
+        try:
+            logger.info("Loading Whisper model…")
+            _stt_model = whisper.load_model("base")
+            logger.info("✓ Whisper model loaded.")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to load Whisper model: {e}")
+            return False
 
 
 def transcribe(audio: np.ndarray) -> str:
+    """Transcribe audio using Whisper."""
     if len(audio) == 0:
         return ""
     if _stt_model is None and not _load_stt_model():
         return ""
     try:
         result = _stt_model.transcribe(audio, fp16=False, language="en")
-        return result["text"].strip()
+        return result.get("text", "").strip()
     except RuntimeError as e:
-        print(f"❌ Hardware/Memory error during transcription: {e}")
+        logger.error(f"❌ Hardware/Memory error during transcription: {e}")
         return ""
     except Exception as e:
-        print(f"⚠️ Unexpected transcription error: {e}")
+        logger.error(f"⚠️ Unexpected transcription error: {e}")
         return ""
 
 
@@ -197,6 +226,7 @@ _LEARNING_PHRASES = [
 
 
 def _is_learning_command(text: str) -> bool:
+    """Check if user is trying to store a memory."""
     lower = text.lower()
     if any(p in lower for p in _LEARNING_PHRASES):
         return True
@@ -206,6 +236,7 @@ def _is_learning_command(text: str) -> bool:
 
 
 def _extract_memory_content(text: str) -> str:
+    """Extract the memory content from a learning command."""
     lower = text.lower()
     # Longer phrases are checked first to avoid partial matches on "remember"
     all_phrases = _LEARNING_PHRASES + ["remember"]
@@ -224,15 +255,17 @@ def _extract_memory_content(text: str) -> str:
 # -------------------------------------------------------------------
 USE_WAKE_WORD = False
 # Longer strings first so "hey friday" matches before "friday"
-_WAKE_WORDS   = ["hey friday", "friday", "jarvis"]
+_WAKE_WORDS = ["hey friday", "friday", "jarvis"]
 
 
 def _has_wake_word(text: str) -> bool:
+    """Check if text contains a wake word."""
     lower = text.lower()
     return any(ww in lower for ww in _WAKE_WORDS)
 
 
 def _strip_wake_word(text: str) -> str:
+    """Remove wake word from text and return the remaining query."""
     lower = text.lower()
     for ww in _WAKE_WORDS:
         pos = lower.find(ww)
@@ -245,16 +278,17 @@ def _strip_wake_word(text: str) -> str:
 # Main loop
 # -------------------------------------------------------------------
 async def main_loop():
+    """Main event loop for voice assistant."""
     print("=" * 50)
     print("Friday Assistant – Push-to-Talk mode")
     print("Hold [F2] to speak, release to process.")
 
     if not _load_stt_model():
-        print("❌ Cannot start without Whisper model.")
+        logger.error("❌ Cannot start without Whisper model.")
         return
 
     if not check_connection():
-        print("⚠️  Ollama not detected — will retry on first query.")
+        logger.warning("⚠️  Ollama not detected — will retry on first query.")
 
     print("Wake word:", "REQUIRED ('Friday')" if USE_WAKE_WORD else "DISABLED")
     print("Say 'exit' or 'goodbye' to quit.")
@@ -267,7 +301,7 @@ async def main_loop():
 
     while True:
         try:
-            audio     = await record_while_key_held("F2")
+            audio = await record_while_key_held("F2")
             user_text = transcribe(audio)
             print(f"You said: {user_text}")
 
@@ -293,6 +327,7 @@ async def main_loop():
                         await text_to_speech("Yes, sir?")
                         continue
                 else:
+                    logger.info("⏩ No wake word detected, ignoring.")
                     print("⏩ No wake word detected, ignoring.\n")
                     continue
             else:
@@ -308,8 +343,20 @@ async def main_loop():
             print("\n\nShutting down…")
             break
         except Exception as e:
+            logger.error(f"⚠️ Error in main loop: {e}", exc_info=True)
             print(f"⚠️ Error in main loop: {e}\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    try:
+        asyncio.run(main_loop())
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        # Cleanup
+        try:
+            if HAS_PYGAME:
+                pygame.mixer.quit()
+            logger.info("Cleanup complete.")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")

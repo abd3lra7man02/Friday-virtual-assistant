@@ -11,10 +11,16 @@ pygame>=2.5.2
 
 # ── LangChain / LangGraph (brain) ───────────────────────────────────
 langchain>=0.3.0
-langchain-ollama>=0.2.0      # provides ChatOllama + OllamaEmbeddings
-langgraph>=0.2.0             # provides create_react_agent + state_modifier
+langchain-ollama>=0.2.0       # provides ChatOllama + OllamaEmbeddings
+langgraph>=0.2.0              # provides create_react_agent + state_modifier
 langchain-chroma>=0.1.0
 chromadb>=0.5.0
+
+# ── FastAPI backend (server) ─────────────────────────────────────────
+# FIXED: These were missing entirely — server.py could never be installed
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9       # Required for FastAPI file/form handling
 
 # ── Google integrations (optional) ──────────────────────────────────
 google-auth>=2.22.0
